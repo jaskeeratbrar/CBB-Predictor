@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'INPUT=$(cat); CMD=$(echo \"$INPUT\" | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('tool_input',{}).get('command',''))\" 2>/dev/null); if echo \"$CMD\" | grep -qE \"main\\.py trade\" && ! echo \"$CMD\" | grep -q \"dry-run\"; then echo \"WARNING: This will place real trades with real money on Kalshi.\" >&2; fi; exit 0'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'INPUT=$(cat); CMD=$(echo \"$INPUT\" | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('tool_input',{}).get('command',''))\" 2>/dev/null); if echo \"$CMD\" | grep -qE \"main\\.py trade\" && ! echo \"$CMD\" | grep -q \"dry-run\"; then echo \"[$(date +%Y-%m-%dT%H:%M:%S)] Trade executed via Claude\" >> ./logs/claude_trades.log 2>/dev/null; fi; exit 0'"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "kalshi": {
+    "api_key_id": "YOUR_API_KEY_ID",
+    "private_key_path": "~/.kalshi/private_key.pem",
+    "base_url": "https://api.elections.kalshi.com/trade-api/v2"
+  },
+  "bankroll": {
+    "initial_cents": 1500,
+    "current_cents": 1500
+  },
+  "risk": {
+    "max_bet_pct": 0.05,
+    "kelly_fraction": 0.10,
+    "daily_loss_limit_pct": 0.15,
+    "consecutive_loss_cooldown": 3,
+    "min_edge_threshold": 0.03,
+    "max_open_positions": 5,
+    "min_bankroll_cents": 200
+  },
+  "data": {
+    "espn_base": "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball",
+    "ncaa_rate_limit_per_sec": 5
+  },
+  "trading": {
+    "paper_mode": true
+  },
+  "scheduler": {
+    "prediction_minutes_before_tip": 30,
+    "daily_data_refresh_hour": 8,
+    "weekly_retrain_day": "monday",
+    "timezone": "US/Eastern"
+  }
+}

@@ -1,0 +1,34 @@
+# Secrets
+config.json
+*.pem
+
+# Database
+cbb.db
+cbb.db-journal
+cbb.db-wal
+cbb.db-shm
+
+# Model artifacts
+models/*.pkl
+
+# Generated reports (regenerated from DB)
+logs/*.md
+reports/*.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
