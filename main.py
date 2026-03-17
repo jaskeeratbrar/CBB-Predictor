@@ -159,12 +159,15 @@ def cmd_predict(args):
     print(f"{'Game':<40} {'Home %':>8} {'Away %':>8} {'Spread':>8} {'Status':>10}")
     print(f"{'-'*80}")
 
-    for game in games:
-        home_stats = db.get_team_stats_latest(game["home_team_id"])
-        away_stats = db.get_team_stats_latest(game["away_team_id"])
+    default_stats = {
+        "elo": 1500.0, "wins": 0, "losses": 0,
+        "offensive_efficiency": 100.0, "defensive_efficiency": 100.0,
+        "tempo": 68.0, "sos": 0.0,
+    }
 
-        if not home_stats or not away_stats:
-            continue
+    for game in games:
+        home_stats = db.get_team_stats_latest(game["home_team_id"]) or default_stats
+        away_stats = db.get_team_stats_latest(game["away_team_id"]) or default_stats
 
         home_name = game.get("home_team_name", f"Team {game['home_team_id']}")
         away_name = game.get("away_team_name", f"Team {game['away_team_id']}")
@@ -325,6 +328,26 @@ def cmd_status(args):
             print(f"    {t.get('side', '?').upper()} x{t['contracts']} @ {t['price']}¢ (edge {t['edge']:.1%})")
     else:
         print(f"\n  No open positions.")
+
+    # Today's slate (active, won, or busted)
+    active_slate = db.get_slate_for_date(today)
+    if active_slate:
+        s = active_slate
+        multiplier = s['current_cents'] / s['initial_cents'] if s['initial_cents'] else 0
+        print(f"\n  Active Slate:")
+        print(f"    Status:    {s['status'].upper()}")
+        print(f"    Legs:      {s['legs_completed']}/{s['total_legs']} complete")
+        print(f"    Initial:   ${s['initial_cents'] / 100:.2f}")
+        print(f"    Rolling:   ${s['current_cents'] / 100:.2f} ({multiplier:.1f}x)")
+
+        legs = db.get_slate_legs(s['id'])
+        if legs:
+            for leg in legs:
+                side = leg.get('side', '?') or '?'
+                price = leg.get('price', 0) or 0
+                edge = leg.get('edge', 0) or 0
+                status_icon = {'pending': '-', 'won': 'W', 'lost': 'L', 'cancelled': 'X'}.get(leg['status'], '?')
+                print(f"    Leg {leg['leg_order']}: [{status_icon}] {side.upper()} @ {price}¢ (edge {edge:.1%}) — ${leg['bet_cents'] / 100:.2f}")
 
     print(f"{'='*50}\n")
 

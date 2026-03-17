@@ -234,7 +234,7 @@ class BotScheduler:
 
     def job_daily_refresh(self) -> None:
         """Morning data refresh: pull today's schedule, refresh stats,
-        and dynamically schedule pre-game prediction jobs."""
+        dynamically schedule pre-game prediction jobs, and build daily slate."""
         start = time.monotonic()
         log.info("=== job_daily_refresh START ===")
         try:
@@ -250,11 +250,180 @@ class BotScheduler:
             games = self.data.fetch_todays_games(today)
             self.schedule_pre_game_jobs(games)
 
+            # Build daily slate from high-edge games
+            self._build_and_schedule_slate(games)
+
         except Exception:
             log.exception("job_daily_refresh FAILED")
         finally:
             elapsed = time.monotonic() - start
             log.info("=== job_daily_refresh END (%.1fs) ===", elapsed)
+
+    def _build_and_schedule_slate(self, espn_games: list) -> None:
+        """Evaluate all games for slate eligibility and schedule slate legs.
+
+        Called during daily refresh. Evaluates edges for all upcoming games,
+        builds a slate if enough qualify, and schedules leg execution jobs.
+        """
+        today_iso = datetime.now().strftime("%Y-%m-%d")
+        today_games = db.get_games_by_date(today_iso)
+
+        if not today_games:
+            log.info("No games in DB for slate evaluation")
+            return
+
+        # Check if a slate already exists for today
+        existing = db.get_active_slate(today_iso)
+        if existing:
+            log.info("Slate %d already exists for today — skipping build", existing["id"])
+            return
+
+        # Evaluate edges for all games
+        games_with_edges = []
+        for game in today_games:
+            home_stats = db.get_team_stats_latest(game["home_team_id"]) or {}
+            away_stats = db.get_team_stats_latest(game["away_team_id"]) or {}
+            game_context = {"home_advantage": 1, "spread": game.get("spread")}
+            features = self.features.build_features(home_stats, away_stats, game_context)
+
+            X = self.features.features_to_array(features)
+            p_home = float(self.model.predict(X)[0])
+
+            # Try to find the ESPN game data for tip-off time
+            tip_off_time = ""
+            for eg in espn_games:
+                espn_id = eg.get("id") or eg.get("espn_game_id", "")
+                if str(espn_id) == str(game.get("espn_game_id", "")):
+                    tip_off_time = eg.get("date", "")
+                    break
+
+            # We need a mock market to evaluate edge if no Kalshi data yet
+            # Use Elo-based implied probability as a proxy market price
+            from features import elo_win_probability
+            home_elo = (home_stats.get("elo") or 1500.0)
+            away_elo = (away_stats.get("elo") or 1500.0)
+            market_implied = elo_win_probability(home_elo, away_elo, home_court=True)
+            yes_price = int(market_implied * 100)
+            yes_price = max(5, min(95, yes_price))  # clamp
+
+            # Calculate edge for both sides
+            edge_yes = p_home - (yes_price / 100.0)
+            edge_no = (yes_price / 100.0) - p_home
+
+            if edge_yes > edge_no and edge_yes > 0:
+                side, edge = "yes", edge_yes
+            elif edge_no > 0:
+                side, edge = "no", edge_no
+            else:
+                continue
+
+            games_with_edges.append({
+                "game_id": game["id"],
+                "edge": edge,
+                "p_home_win": p_home,
+                "side": side,
+                "tip_off_time": tip_off_time,
+                "market": {
+                    "yes_price": yes_price,
+                    "no_price": 100 - yes_price,
+                    "kalshi_ticker": f"SLATE_{game['espn_game_id']}",
+                    "kalshi_event_ticker": "",
+                    "volume": 0,
+                },
+                "home_name": game.get("home_team_name", ""),
+                "away_name": game.get("away_team_name", ""),
+            })
+
+        # Build slate
+        slate_plan = self.trading.build_daily_slate(games_with_edges)
+        if not slate_plan:
+            log.info("No slate built today — not enough qualifying games")
+            return
+
+        # Schedule slate leg jobs
+        sched_cfg = self.config.get("scheduler", {})
+        minutes_before = sched_cfg.get("prediction_minutes_before_tip", 30)
+
+        for i, leg in enumerate(slate_plan["legs"]):
+            leg_order = i + 1
+            tip_off_str = leg.get("tip_off_time", "")
+            if not tip_off_str:
+                continue
+
+            try:
+                tip_off = datetime.fromisoformat(tip_off_str.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                log.warning("Cannot parse tip-off for slate leg %d", leg_order)
+                continue
+
+            run_at = tip_off - timedelta(minutes=minutes_before)
+            if run_at <= datetime.now(run_at.tzinfo):
+                # Already past — run immediately for leg 1, skip others
+                if leg_order == 1:
+                    log.info("Slate leg 1 run time passed — executing immediately")
+                    self._execute_slate_leg_job(
+                        slate_plan["slate_id"], leg_order, leg
+                    )
+                continue
+
+            job_id = f"slate_{slate_plan['slate_id']}_leg_{leg_order}"
+            self.scheduler.add_job(
+                self._execute_slate_leg_job,
+                trigger=DateTrigger(run_date=run_at),
+                args=[slate_plan["slate_id"], leg_order, leg],
+                id=job_id,
+                name=f"Slate leg {leg_order}: {leg.get('home_name', '?')} vs {leg.get('away_name', '?')}",
+                misfire_grace_time=3600,
+                coalesce=True,
+                replace_existing=True,
+            )
+            log.info("Scheduled slate leg %d at %s", leg_order, run_at)
+
+    def _execute_slate_leg_job(self, slate_id: int, leg_order: int, leg_info: dict) -> None:
+        """Job callback for executing a single slate leg."""
+        log.info("=== slate_leg START [slate=%d, leg=%d] ===", slate_id, leg_order)
+        try:
+            # If not the first leg, check that previous leg has settled
+            if leg_order > 1:
+                prev_result = self.trading.settle_slate_leg(slate_id, leg_order - 1)
+                if prev_result is None:
+                    # Previous leg not settled — reschedule for 15 min later
+                    job_id = f"slate_{slate_id}_leg_{leg_order}_retry"
+                    run_at = datetime.now() + timedelta(minutes=15)
+                    self.scheduler.add_job(
+                        self._execute_slate_leg_job,
+                        trigger=DateTrigger(run_date=run_at),
+                        args=[slate_id, leg_order, leg_info],
+                        id=job_id,
+                        name=f"Slate leg {leg_order} retry",
+                        misfire_grace_time=3600,
+                        replace_existing=True,
+                    )
+                    log.info("Previous leg not settled — retrying leg %d in 15 min", leg_order)
+                    return
+                if prev_result["result"] == "lost":
+                    log.info("Previous leg lost — slate busted, cancelling leg %d", leg_order)
+                    return
+
+            # Build evaluation for this leg's game
+            game_eval = self.trading.evaluate_game(
+                leg_info["game_id"],
+                leg_info["p_home_win"],
+                leg_info["market"],
+            )
+
+            if not game_eval.get("should_trade"):
+                log.info("Slate leg %d: evaluation says no trade — %s",
+                         leg_order, game_eval.get("reason"))
+                return
+
+            result = self.trading.execute_slate_leg(slate_id, leg_order, game_eval)
+            log.info("Slate leg %d result: %s", leg_order, result)
+
+        except Exception:
+            log.exception("Slate leg %d execution failed", leg_order)
+        finally:
+            log.info("=== slate_leg END [slate=%d, leg=%d] ===", slate_id, leg_order)
 
     def job_pre_game(self, game_id: str) -> None:
         """Pre-game prediction and trade execution for a single game.
@@ -378,7 +547,8 @@ class BotScheduler:
             log.info("=== job_pre_game END [game %s] (%.1fs) ===", game_id, elapsed)
 
     def job_settle(self) -> None:
-        """Check for completed games, update scores, and settle trades."""
+        """Check for completed games, update scores, settle trades, and
+        advance any active slate legs."""
         start = time.monotonic()
         log.info("=== job_settle START ===")
         try:
@@ -390,13 +560,29 @@ class BotScheduler:
             settlements = self.trading.settle_trades()
             log.info("Settlements: %s", settlements)
 
-            # 3 -- Update Elo ratings for newly completed games
+            # 3 -- Settle active slate legs
+            today_iso = datetime.now().strftime("%Y-%m-%d")
+            active_slate = db.get_active_slate(today_iso)
+            if active_slate:
+                legs = db.get_slate_legs(active_slate["id"])
+                for leg in legs:
+                    if leg["status"] == "pending":
+                        result = self.trading.settle_slate_leg(
+                            active_slate["id"], leg["leg_order"]
+                        )
+                        if result:
+                            log.info(
+                                "Slate leg %d settled: %s (rolling=%dc)",
+                                leg["leg_order"], result["result"],
+                                result["new_rolling_total"],
+                            )
+
+            # 4 -- Update Elo ratings for newly completed games
             completed = result_summary.get("results", [])
             if completed:
                 elo_games = []
                 for r in completed:
                     espn_id = r.get("espn_game_id")
-                    # Look up DB game to get team IDs
                     today = datetime.now().strftime("%Y-%m-%d")
                     today_games = db.get_games_by_date(today)
                     for g in today_games:

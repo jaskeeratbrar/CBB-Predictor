@@ -226,6 +226,34 @@ class ReviewSystem:
 
         lines.append("")
 
+        # --- Slate performance ---
+        active_slate = db.get_slate_for_date(date_str)
+        if active_slate:
+            lines.append("## Slate (Progressive Rollover)")
+            s = active_slate
+            legs = db.get_slate_legs(s["id"])
+            multiplier = s["current_cents"] / s["initial_cents"] if s["initial_cents"] else 0
+            lines.append(f"- **Status:** {s['status'].upper()}")
+            lines.append(f"- **Legs:** {s['legs_completed']}/{s['total_legs']}")
+            lines.append(f"- **Initial:** {self.format_cents(s['initial_cents'])}")
+            lines.append(f"- **Final:** {self.format_cents(s['current_cents'])} ({multiplier:.1f}x)")
+            slate_pnl = s["current_cents"] - s["initial_cents"]
+            lines.append(f"- **Slate P&L:** {self._pnl_str(slate_pnl)}")
+            if legs:
+                lines.append("")
+                lines.append("| Leg | Side | Price | Edge | Bet | Status |")
+                lines.append("|-----|------|-------|------|-----|--------|")
+                for leg in legs:
+                    side = (leg.get("side") or "?").upper()
+                    price = leg.get("price", 0) or 0
+                    edge = leg.get("edge", 0) or 0
+                    lines.append(
+                        f"| {leg['leg_order']} | {side} | {price}¢ | "
+                        f"{edge:.1%} | {self.format_cents(leg['bet_cents'])} | "
+                        f"{leg['status']} |"
+                    )
+            lines.append("")
+
         # Write file
         out_path = LOGS_DIR / f"{date_str}.md"
         out_path.write_text("\n".join(lines), encoding="utf-8")
@@ -380,6 +408,28 @@ class ReviewSystem:
         lines.append(f"- **Daily limits hit:** {daily_limits_hit} time(s)")
         lines.append(f"- **Cooldowns triggered:** {cooldowns_triggered} time(s)")
         lines.append(f"- **Max drawdown:** {self.format_cents(max_drawdown)}")
+        lines.append("")
+
+        # --- Slate Performance ---
+        lines.append("## Slate Performance")
+        slates = db.get_slate_history(days=7)
+        if slates:
+            total_slates = len(slates)
+            won_slates = sum(1 for s in slates if s["status"] == "won")
+            busted_slates = sum(1 for s in slates if s["status"] == "busted")
+            slate_pnl = sum(s["current_cents"] - s["initial_cents"] for s in slates)
+            avg_multiplier = (
+                sum(s["current_cents"] / s["initial_cents"] for s in slates if s["status"] == "won" and s["initial_cents"])
+                / won_slates if won_slates else 0
+            )
+            lines.append(f"- **Slates attempted:** {total_slates}")
+            lines.append(f"- **Full wins:** {won_slates} ({won_slates/total_slates:.0%})" if total_slates else "")
+            lines.append(f"- **Busted:** {busted_slates}")
+            lines.append(f"- **Total slate P&L:** {self._pnl_str(slate_pnl)}")
+            if won_slates:
+                lines.append(f"- **Avg winning multiplier:** {avg_multiplier:.1f}x")
+        else:
+            lines.append("_No slates this week._")
         lines.append("")
 
         # --- Bankroll Trajectory ---

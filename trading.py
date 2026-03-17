@@ -814,6 +814,286 @@ class TradingEngine:
             log.error("Error looking up game for trade %d: %s", trade["id"], exc)
             return None
 
+    # ------------------------------------------------------------------
+    # Slate (progressive rollover parlay)
+    # ------------------------------------------------------------------
+
+    SLATE_EDGE_THRESHOLD = 0.05  # 5% min edge for slate legs
+    SLATE_BANKROLL_FRACTION = 0.50  # 50% of bankroll allocated to slates
+    SLATE_MIN_BANKROLL = 400  # Don't create slates if bankroll < $4
+
+    def build_daily_slate(self, games_with_edges: list) -> Optional[dict]:
+        """Build a progressive rollover slate from today's high-edge games.
+
+        Args:
+            games_with_edges: List of dicts with keys:
+                game_id, edge, p_home_win, market, tip_off_time, side
+
+        Returns:
+            Slate plan dict or None if not enough qualifying games.
+        """
+        bankroll = self._get_bankroll_cents()
+        if bankroll < self.SLATE_MIN_BANKROLL:
+            log.info("Bankroll %d < %d — skipping slate", bankroll, self.SLATE_MIN_BANKROLL)
+            return None
+
+        # Filter to games meeting slate edge threshold
+        qualified = [
+            g for g in games_with_edges
+            if g.get("edge", 0) >= self.SLATE_EDGE_THRESHOLD
+        ]
+
+        if len(qualified) < 2:
+            log.info("Only %d games with edge >= %.0f%% — no slate today",
+                     len(qualified), self.SLATE_EDGE_THRESHOLD * 100)
+            return None
+
+        # Sort by tip-off time
+        qualified.sort(key=lambda g: g.get("tip_off_time", ""))
+
+        # Remove games with overlapping tip-off times (keep higher edge)
+        deduped = []
+        for g in qualified:
+            tip = g.get("tip_off_time", "")
+            if deduped and deduped[-1].get("tip_off_time", "") == tip:
+                # Same time — keep higher edge
+                if g["edge"] > deduped[-1]["edge"]:
+                    deduped[-1] = g
+            else:
+                deduped.append(g)
+
+        if len(deduped) < 2:
+            log.info("Only %d games after dedup — no slate today", len(deduped))
+            return None
+
+        # Calculate initial allocation
+        initial_cents = int(bankroll * self.SLATE_BANKROLL_FRACTION)
+        today = self._today()
+
+        # Create slate in DB
+        slate_id = self.db.create_slate(today, initial_cents, len(deduped))
+        log.info(
+            "Created slate %d: %d legs, initial %d cents (%.0f%% of %d bankroll)",
+            slate_id, len(deduped), initial_cents,
+            self.SLATE_BANKROLL_FRACTION * 100, bankroll,
+        )
+
+        return {
+            "slate_id": slate_id,
+            "initial_cents": initial_cents,
+            "legs": deduped,
+            "total_legs": len(deduped),
+        }
+
+    def execute_slate_leg(self, slate_id: int, leg_order: int, game_eval: dict) -> dict:
+        """Execute a single leg of a progressive rollover slate.
+
+        Args:
+            slate_id: DB slate ID.
+            leg_order: 1-based leg order.
+            game_eval: Evaluation dict from evaluate_game() — must have
+                       should_trade=True (edge/risk already checked).
+
+        Returns:
+            {success, trade_id, bet_cents, order_id, error}
+        """
+        slate = self.db.get_active_slate(self._today())
+        if not slate or slate["id"] != slate_id:
+            return {"success": False, "trade_id": None, "bet_cents": 0,
+                    "order_id": None, "error": "Slate not found or not active"}
+
+        # Check if slate is busted
+        if slate["status"] == "busted":
+            return {"success": False, "trade_id": None, "bet_cents": 0,
+                    "order_id": None, "error": "Slate already busted"}
+
+        # Bet amount = current rolling total (all-in each leg)
+        bet_cents = slate["current_cents"]
+        if bet_cents <= 0:
+            return {"success": False, "trade_id": None, "bet_cents": 0,
+                    "order_id": None, "error": "No funds in slate"}
+
+        # Override the evaluation's contracts based on slate bet size
+        ticker = game_eval["ticker"]
+        side = game_eval["side"]
+        price = game_eval["price"]
+        edge = game_eval["edge"]
+
+        # Calculate contracts from slate budget
+        num_contracts = bet_cents // price
+        if num_contracts <= 0:
+            num_contracts = 1  # minimum 1 contract
+
+        log.info(
+            "Slate %d leg %d: %s %s @ %dc x %d (slate_budget=%dc)",
+            slate_id, leg_order, side.upper(), ticker, price, num_contracts, bet_cents,
+        )
+
+        # Execute the trade (paper or real)
+        modified_eval = dict(game_eval)
+        modified_eval["contracts"] = num_contracts
+        modified_eval["should_trade"] = True
+        exec_result = self.execute_trade(modified_eval)
+
+        if not exec_result["success"]:
+            return {"success": False, "trade_id": None, "bet_cents": bet_cents,
+                    "order_id": None, "error": exec_result.get("error")}
+
+        # Record the slate leg
+        trade_id = exec_result["trade_id"]
+        leg_id = self.db.add_slate_leg(slate_id, trade_id, leg_order, bet_cents)
+
+        # Mark slate as active
+        self.db.update_slate(slate_id, status="active")
+
+        log.info(
+            "Slate %d leg %d placed: trade_id=%s, bet=%dc",
+            slate_id, leg_order, trade_id, bet_cents,
+        )
+
+        return {
+            "success": True,
+            "trade_id": trade_id,
+            "bet_cents": bet_cents,
+            "order_id": exec_result.get("order_id"),
+            "error": None,
+        }
+
+    def settle_slate_leg(self, slate_id: int, leg_order: int) -> Optional[dict]:
+        """Settle a single slate leg and update the rolling total.
+
+        Returns:
+            {result, pnl_cents, new_rolling_total} or None if not settleable yet.
+        """
+        legs = self.db.get_slate_legs(slate_id)
+        leg = None
+        for l in legs:
+            if l["leg_order"] == leg_order:
+                leg = l
+                break
+
+        if not leg or leg["status"] != "pending":
+            return None
+
+        trade_id = leg["trade_id"]
+        if not trade_id:
+            return None
+
+        # Look up the trade to check if it's settled
+        from db import get_conn
+        with get_conn() as conn:
+            trade_row = conn.execute(
+                "SELECT * FROM trades WHERE id = ?", (trade_id,)
+            ).fetchone()
+
+        if not trade_row:
+            return None
+
+        trade = dict(trade_row)
+        if trade["status"] not in ("won", "lost"):
+            return None  # Not settled yet
+
+        bet_cents = leg["bet_cents"]
+        price = trade["price"]
+        contracts = trade["contracts"]
+
+        if trade["status"] == "won":
+            pnl_cents = (100 - price) * contracts
+            new_rolling = bet_cents + pnl_cents
+            self.db.update_slate_leg(leg["id"], "won")
+            log.info(
+                "Slate %d leg %d WON: bet=%dc, pnl=+%dc, rolling=%dc",
+                slate_id, leg_order, bet_cents, pnl_cents, new_rolling,
+            )
+        else:
+            pnl_cents = -(price * contracts)
+            new_rolling = 0
+            self.db.update_slate_leg(leg["id"], "lost")
+            log.info(
+                "Slate %d leg %d LOST: bet=%dc, pnl=%dc — slate busted",
+                slate_id, leg_order, bet_cents, pnl_cents,
+            )
+
+        # Update slate
+        slate = self.db.get_active_slate(self._today())
+        if not slate:
+            return {"result": trade["status"], "pnl_cents": pnl_cents,
+                    "new_rolling_total": new_rolling}
+
+        new_legs_completed = slate["legs_completed"] + 1
+
+        if trade["status"] == "lost":
+            # Bust — cancel remaining legs
+            self.db.update_slate(
+                slate_id,
+                status="busted",
+                current_cents=0,
+                legs_completed=new_legs_completed,
+            )
+            # Cancel remaining legs
+            for remaining_leg in legs:
+                if remaining_leg["leg_order"] > leg_order and remaining_leg["status"] == "pending":
+                    self.db.update_slate_leg(remaining_leg["id"], "cancelled")
+            log.warning("Slate %d BUSTED at leg %d/%d", slate_id, leg_order, slate["total_legs"])
+
+        elif new_legs_completed >= slate["total_legs"]:
+            # All legs won!
+            self.db.update_slate(
+                slate_id,
+                status="won",
+                current_cents=new_rolling,
+                legs_completed=new_legs_completed,
+            )
+            multiplier = new_rolling / slate["initial_cents"] if slate["initial_cents"] else 0
+            log.info(
+                "Slate %d COMPLETE: %dc -> %dc (%.1fx multiplier)",
+                slate_id, slate["initial_cents"], new_rolling, multiplier,
+            )
+        else:
+            # More legs to go
+            self.db.update_slate(
+                slate_id,
+                current_cents=new_rolling,
+                legs_completed=new_legs_completed,
+            )
+
+        return {
+            "result": trade["status"],
+            "pnl_cents": pnl_cents,
+            "new_rolling_total": new_rolling,
+        }
+
+    def get_singles_budget(self) -> int:
+        """Return the bankroll available for single bets (excludes slate allocation)."""
+        bankroll = self._get_bankroll_cents()
+        today = self._today()
+        active_slate = self.db.get_active_slate(today)
+        if active_slate:
+            return int(bankroll * (1.0 - self.SLATE_BANKROLL_FRACTION))
+        return bankroll
+
+    def get_slate_game_ids(self) -> set:
+        """Return game_ids currently in an active slate (to exclude from singles)."""
+        today = self._today()
+        active_slate = self.db.get_active_slate(today)
+        if not active_slate:
+            return set()
+        legs = self.db.get_slate_legs(active_slate["id"])
+        game_ids = set()
+        from db import get_conn
+        for leg in legs:
+            if leg.get("trade_id"):
+                with get_conn() as conn:
+                    row = conn.execute(
+                        """SELECT m.game_id FROM trades t
+                           JOIN markets m ON t.market_id = m.id
+                           WHERE t.id = ?""",
+                        (leg["trade_id"],),
+                    ).fetchone()
+                    if row:
+                        game_ids.add(row["game_id"])
+        return game_ids
+
     def update_bankroll_after_settlement(self, pnl_cents: int) -> int:
         """Update bankroll in DB after settlement.
 

@@ -132,6 +132,27 @@ def init_db() -> None:
                 consecutive_losses  INTEGER DEFAULT 0,
                 is_cooldown         INTEGER DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS slates (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                date            TEXT,
+                status          TEXT DEFAULT 'pending',
+                initial_cents   INTEGER,
+                current_cents   INTEGER,
+                total_legs      INTEGER,
+                legs_completed  INTEGER DEFAULT 0,
+                created_at      TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS slate_legs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                slate_id    INTEGER REFERENCES slates(id),
+                trade_id    INTEGER REFERENCES trades(id),
+                leg_order   INTEGER,
+                bet_cents   INTEGER,
+                status      TEXT DEFAULT 'pending',
+                UNIQUE(slate_id, leg_order)
+            );
         """)
 
 
@@ -145,11 +166,15 @@ def upsert_team(
     abbreviation: Optional[str] = None,
     conference: Optional[str] = None,
 ) -> int:
-    """Insert or replace a team row and return its id."""
+    """Insert a team or update it if the name already exists, preserving the row id."""
     with get_conn() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO teams (name, espn_id, abbreviation, conference)
-               VALUES (?, ?, ?, ?)""",
+            """INSERT INTO teams (name, espn_id, abbreviation, conference)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET
+                   espn_id = COALESCE(excluded.espn_id, teams.espn_id),
+                   abbreviation = COALESCE(excluded.abbreviation, teams.abbreviation),
+                   conference = COALESCE(excluded.conference, teams.conference)""",
             (name, espn_id, abbreviation, conference),
         )
         row = conn.execute(
@@ -498,3 +523,104 @@ def save_model_version(
                 notes,
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# Slates (progressive rollover parlays)
+# ---------------------------------------------------------------------------
+
+def create_slate(date: str, initial_cents: int, total_legs: int) -> int:
+    """Create a new slate and return its id."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO slates (date, status, initial_cents, current_cents,
+                                   total_legs, legs_completed, created_at)
+               VALUES (?, 'pending', ?, ?, ?, 0, ?)""",
+            (date, initial_cents, initial_cents, total_legs,
+             datetime.utcnow().isoformat()),
+        )
+        return cur.lastrowid
+
+
+def add_slate_leg(
+    slate_id: int, trade_id: int, leg_order: int, bet_cents: int,
+) -> int:
+    """Add a leg to a slate and return its id."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO slate_legs (slate_id, trade_id, leg_order, bet_cents, status)
+               VALUES (?, ?, ?, ?, 'pending')""",
+            (slate_id, trade_id, leg_order, bet_cents),
+        )
+        return cur.lastrowid
+
+
+def update_slate_leg(leg_id: int, status: str) -> None:
+    """Update a slate leg's status (won, lost, cancelled)."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE slate_legs SET status = ? WHERE id = ?",
+            (status, leg_id),
+        )
+
+
+def update_slate(slate_id: int, **kwargs: object) -> None:
+    """Update arbitrary fields on a slate row."""
+    if not kwargs:
+        return
+    columns = ", ".join(f"{k} = ?" for k in kwargs)
+    values = list(kwargs.values()) + [slate_id]
+    with get_conn() as conn:
+        conn.execute(
+            f"UPDATE slates SET {columns} WHERE id = ?", values,
+        )
+
+
+def get_active_slate(date: str) -> Optional[dict]:
+    """Return the active or pending slate for a given date, if any."""
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT * FROM slates
+               WHERE date = ? AND status IN ('pending', 'active')
+               ORDER BY id DESC LIMIT 1""",
+            (date,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_slate_for_date(date: str) -> Optional[dict]:
+    """Return the most recent slate for a given date (any status)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT * FROM slates WHERE date = ?
+               ORDER BY id DESC LIMIT 1""",
+            (date,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_slate_legs(slate_id: int) -> list:
+    """Return all legs for a slate, ordered by leg_order."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT sl.*, t.side, t.price, t.edge, t.pnl,
+                      t.order_id, t.status AS trade_status
+               FROM slate_legs sl
+               LEFT JOIN trades t ON sl.trade_id = t.id
+               WHERE sl.slate_id = ?
+               ORDER BY sl.leg_order""",
+            (slate_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_slate_history(days: int = 7) -> list:
+    """Return slates from the last N days."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM slates
+               WHERE date >= date('now', ? || ' days')
+               ORDER BY date DESC, id DESC""",
+            (f"-{days}",),
+        ).fetchall()
+        return [dict(r) for r in rows]
